@@ -332,3 +332,239 @@ class TestModeCortexRuntime:
             mock_task1.cancel.assert_called_once()
             mock_task2.cancel.assert_called_once()
             mock_gather.assert_called_once()
+
+
+class TestModeTransitionRecovery:
+    """Test cases for mode transition recovery mechanism."""
+
+    @pytest.mark.asyncio
+    async def test_create_backup_state(self, cortex_runtime):
+        """Test backup state creation."""
+        runtime, mocks = cortex_runtime
+        
+        mock_config = Mock()
+        runtime.current_config = mock_config
+        
+        runtime._create_backup_state("test_mode")
+        
+        assert runtime._backup_mode_name == "test_mode"
+        assert runtime._backup_config == mock_config
+
+    @pytest.mark.asyncio
+    async def test_clear_backup_state(self, cortex_runtime):
+        """Test backup state clearing."""
+        runtime, mocks = cortex_runtime
+        
+        runtime._backup_mode_name = "test_mode"
+        runtime._backup_config = Mock()
+        
+        runtime._clear_backup_state()
+        
+        assert runtime._backup_mode_name is None
+        assert runtime._backup_config is None
+
+    @pytest.mark.asyncio
+    async def test_rollback_to_backup_success(self, cortex_runtime):
+        """Test successful rollback to backup mode."""
+        runtime, mocks = cortex_runtime
+        
+        # Setup backup state
+        mock_backup_config = Mock()
+        mock_backup_config.agent_inputs = []
+        runtime._backup_mode_name = "backup_mode"
+        runtime._backup_config = mock_backup_config
+        
+        with (
+            patch.object(runtime, "_stop_current_orchestrators") as mock_stop,
+            patch.object(runtime, "_start_orchestrators") as mock_start,
+            patch("runtime.multi_mode.cortex.Fuser") as mock_fuser_class,
+            patch("runtime.multi_mode.cortex.ActionOrchestrator") as mock_action_class,
+            patch("runtime.multi_mode.cortex.SimulatorOrchestrator") as mock_simulator_class,
+            patch("runtime.multi_mode.cortex.BackgroundOrchestrator") as mock_background_class,
+        ):
+            await runtime._rollback_to_backup()
+            
+            mock_stop.assert_called_once()
+            mock_start.assert_called_once()
+            assert runtime.current_config == mock_backup_config
+            assert runtime.mode_manager.state.current_mode == "backup_mode"
+
+    @pytest.mark.asyncio
+    async def test_rollback_to_backup_no_backup(self, cortex_runtime):
+        """Test rollback fails when no backup exists."""
+        runtime, mocks = cortex_runtime
+        
+        runtime._backup_mode_name = None
+        
+        with pytest.raises(RuntimeError, match="No backup state available"):
+            await runtime._rollback_to_backup()
+
+    @pytest.mark.asyncio
+    async def test_emergency_mode_recovery(self, cortex_runtime, mock_mode_config):
+        """Test emergency mode recovery."""
+        runtime, mocks = cortex_runtime
+        
+        with (
+            patch.object(runtime, "_stop_current_orchestrators") as mock_stop,
+            patch.object(runtime, "_initialize_mode") as mock_init,
+            patch.object(runtime, "_start_orchestrators") as mock_start,
+        ):
+            await runtime._emergency_mode_recovery("safe_mode")
+            
+            mock_stop.assert_called_once()
+            mock_init.assert_called_once_with("safe_mode")
+            mock_start.assert_called_once()
+            assert runtime.mode_manager.state.current_mode == "safe_mode"
+            assert runtime.mode_manager.state.previous_mode is None
+
+    @pytest.mark.asyncio
+    async def test_handle_transition_failure_rollback_success(self, cortex_runtime):
+        """Test transition failure with successful rollback."""
+        runtime, mocks = cortex_runtime
+        
+        runtime._backup_mode_name = "previous_mode"
+        runtime._backup_config = Mock()
+        
+        with (
+            patch.object(runtime, "_rollback_to_backup") as mock_rollback,
+            patch("runtime.multi_mode.cortex.ElevenLabsTTSProvider") as mock_tts_class,
+        ):
+            mock_tts = Mock()
+            mock_tts.add_pending_message = Mock()
+            mock_tts_class.return_value = mock_tts
+            
+            test_error = Exception("Transition failed")
+            await runtime._handle_transition_failure("from_mode", "to_mode", test_error)
+            
+            mock_rollback.assert_called_once()
+            mock_tts.add_pending_message.assert_called_once_with(
+                "Mode transition failed. Returning to previous mode."
+            )
+
+    @pytest.mark.asyncio
+    async def test_handle_transition_failure_rollback_fails_emergency_recovery(
+        self, cortex_runtime
+    ):
+        """Test transition failure with rollback failure, then emergency recovery."""
+        runtime, mocks = cortex_runtime
+        
+        runtime._backup_mode_name = "previous_mode"
+        runtime.mode_config.default_mode = "default"
+        
+        with (
+            patch.object(
+                runtime, "_rollback_to_backup", side_effect=Exception("Rollback failed")
+            ) as mock_rollback,
+            patch.object(runtime, "_emergency_mode_recovery") as mock_emergency,
+            patch("runtime.multi_mode.cortex.ElevenLabsTTSProvider") as mock_tts_class,
+        ):
+            mock_tts = Mock()
+            mock_tts.add_pending_message = Mock()
+            mock_tts_class.return_value = mock_tts
+            
+            test_error = Exception("Transition failed")
+            await runtime._handle_transition_failure("from_mode", "to_mode", test_error)
+            
+            mock_rollback.assert_called_once()
+            mock_emergency.assert_called_once_with("default")
+            mock_tts.add_pending_message.assert_called_once_with(
+                "Mode transition failed. Switching to safe mode."
+            )
+
+    @pytest.mark.asyncio
+    async def test_handle_transition_failure_all_recovery_fails(self, cortex_runtime):
+        """Test transition failure when all recovery attempts fail."""
+        runtime, mocks = cortex_runtime
+        
+        runtime._backup_mode_name = "previous_mode"
+        runtime.mode_config.default_mode = "default"
+        
+        with (
+            patch.object(
+                runtime, "_rollback_to_backup", side_effect=Exception("Rollback failed")
+            ),
+            patch.object(
+                runtime,
+                "_emergency_mode_recovery",
+                side_effect=Exception("Emergency recovery failed"),
+            ),
+            patch("runtime.multi_mode.cortex.ElevenLabsTTSProvider") as mock_tts_class,
+        ):
+            mock_tts = Mock()
+            mock_tts.add_pending_message = Mock()
+            mock_tts_class.return_value = mock_tts
+            
+            test_error = Exception("Transition failed")
+            
+            with pytest.raises(
+                RuntimeError,
+                match="Failed to transition to to_mode and all recovery attempts failed",
+            ):
+                await runtime._handle_transition_failure(
+                    "from_mode", "to_mode", test_error
+                )
+            
+            # Should have called both TTS messages
+            assert mock_tts.add_pending_message.call_count == 1
+            mock_tts.add_pending_message.assert_called_with(
+                "Critical error: unable to recover mode. Please restart the system."
+            )
+
+    @pytest.mark.asyncio
+    async def test_on_mode_transition_with_recovery(self, cortex_runtime):
+        """Test mode transition that fails and recovers."""
+        runtime, mocks = cortex_runtime
+        
+        mock_from_mode = Mock()
+        mock_from_mode.exit_message = "Exiting"
+        runtime.mode_config.modes = {"from_mode": mock_from_mode, "to_mode": Mock()}
+        
+        with (
+            patch.object(runtime, "_stop_current_orchestrators"),
+            patch.object(
+                runtime, "_initialize_mode", side_effect=Exception("Init failed")
+            ),
+            patch.object(runtime, "_handle_transition_failure") as mock_handle_failure,
+        ):
+            await runtime._on_mode_transition("from_mode", "to_mode")
+            
+            mock_handle_failure.assert_called_once()
+            assert runtime._transition_in_progress is False
+
+    @pytest.mark.asyncio
+    async def test_concurrent_transition_prevention(self, cortex_runtime):
+        """Test that concurrent transitions are prevented."""
+        runtime, mocks = cortex_runtime
+        
+        runtime._transition_in_progress = True
+        
+        with (
+            patch.object(runtime, "_stop_current_orchestrators") as mock_stop,
+        ):
+            await runtime._on_mode_transition("from_mode", "to_mode")
+            
+            # Should not have attempted to stop orchestrators
+            mock_stop.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_successful_transition_clears_backup(self, cortex_runtime):
+        """Test that successful transition clears backup state."""
+        runtime, mocks = cortex_runtime
+        
+        mock_from_mode = Mock()
+        mock_from_mode.exit_message = "Exiting"
+        mock_to_mode = Mock()
+        mock_to_mode.entry_message = "Entering"
+        runtime.mode_config.modes = {"from_mode": mock_from_mode, "to_mode": mock_to_mode}
+        
+        with (
+            patch.object(runtime, "_stop_current_orchestrators"),
+            patch.object(runtime, "_initialize_mode"),
+            patch.object(runtime, "_start_orchestrators"),
+            patch.object(runtime, "_clear_backup_state") as mock_clear,
+            patch("runtime.multi_mode.cortex.ElevenLabsTTSProvider"),
+        ):
+            await runtime._on_mode_transition("from_mode", "to_mode")
+            
+            mock_clear.assert_called_once()
+            assert runtime._transition_in_progress is False

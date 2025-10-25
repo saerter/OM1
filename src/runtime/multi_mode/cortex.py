@@ -48,6 +48,11 @@ class ModeCortexRuntime:
         self.action_task: Optional[asyncio.Future] = None
         self.background_task: Optional[asyncio.Future] = None
 
+        # Backup state for recovery mechanism
+        self._backup_config: Optional[RuntimeConfig] = None
+        self._backup_mode_name: Optional[str] = None
+        self._transition_in_progress = False
+
         # Setup transition callback
         self.mode_manager.add_transition_callback(self._on_mode_transition)
 
@@ -92,7 +97,17 @@ class ModeCortexRuntime:
         """
         logging.info(f"Handling mode transition: {from_mode} -> {to_mode}")
 
+        # Prevent concurrent transitions
+        if self._transition_in_progress:
+            logging.warning("Transition already in progress, skipping")
+            return
+
+        self._transition_in_progress = True
+
         try:
+            # Create backup of current state before transition
+            self._create_backup_state(from_mode)
+
             # Play exit message if enabled
             if self.mode_config.transition_announcement:
                 from_config = self.mode_config.modes[from_mode]
@@ -119,11 +134,159 @@ class ModeCortexRuntime:
                     logging.info(f"Mode entry: {to_config.entry_message}")
 
             logging.info(f"Successfully transitioned to mode: {to_mode}")
+            # Clear backup on successful transition
+            self._clear_backup_state()
 
         except Exception as e:
             logging.error(f"Error during mode transition {from_mode} -> {to_mode}: {e}")
-            # TODO: Implement fallback/recovery mechanism
-            raise
+            # Implement fallback/recovery mechanism
+            await self._handle_transition_failure(from_mode, to_mode, e)
+
+        finally:
+            self._transition_in_progress = False
+
+    async def _handle_transition_failure(
+        self, from_mode: str, to_mode: str, error: Exception
+    ):
+        """
+        Handle transition failures with a multi-stage recovery strategy.
+
+        Parameters
+        ----------
+        from_mode : str
+            The mode we were transitioning from
+        to_mode : str
+            The mode we failed to transition to
+        error : Exception
+            The exception that caused the failure
+        """
+        logging.error(
+            f"Initiating recovery from failed transition {from_mode} -> {to_mode}"
+        )
+
+        # Stage 1: Try to rollback to previous mode
+        if self._backup_mode_name and self._backup_mode_name != to_mode:
+            logging.info(f"Attempting rollback to previous mode: {self._backup_mode_name}")
+            try:
+                await self._rollback_to_backup()
+                logging.info(
+                    f"Successfully rolled back to mode: {self._backup_mode_name}"
+                )
+                ElevenLabsTTSProvider().add_pending_message(
+                    "Mode transition failed. Returning to previous mode."
+                )
+                return
+            except Exception as rollback_error:
+                logging.error(
+                    f"Rollback to {self._backup_mode_name} failed: {rollback_error}"
+                )
+
+        # Stage 2: Try to transition to default safe mode
+        default_mode = self.mode_config.default_mode
+        if default_mode != to_mode and default_mode != from_mode:
+            logging.info(f"Attempting recovery to default mode: {default_mode}")
+            try:
+                await self._emergency_mode_recovery(default_mode)
+                logging.info(f"Successfully recovered to default mode: {default_mode}")
+                ElevenLabsTTSProvider().add_pending_message(
+                    "Mode transition failed. Switching to safe mode."
+                )
+                return
+            except Exception as default_error:
+                logging.error(
+                    f"Recovery to default mode {default_mode} failed: {default_error}"
+                )
+
+        # Stage 3: Critical failure - try to maintain minimal functionality
+        logging.critical(
+            "All recovery attempts failed. System may be in unstable state."
+        )
+        ElevenLabsTTSProvider().add_pending_message(
+            "Critical error: unable to recover mode. Please restart the system."
+        )
+        raise RuntimeError(
+            f"Failed to transition to {to_mode} and all recovery attempts failed"
+        ) from error
+
+    def _create_backup_state(self, mode_name: str):
+        """
+        Create a backup of the current mode state for potential rollback.
+
+        Parameters
+        ----------
+        mode_name : str
+            The name of the mode to backup
+        """
+        logging.debug(f"Creating backup of mode: {mode_name}")
+        self._backup_mode_name = mode_name
+        self._backup_config = self.current_config
+        logging.debug(f"Backup created for mode: {mode_name}")
+
+    def _clear_backup_state(self):
+        """Clear the backup state after a successful transition."""
+        logging.debug("Clearing backup state")
+        self._backup_mode_name = None
+        self._backup_config = None
+
+    async def _rollback_to_backup(self):
+        """
+        Rollback to the previously backed up mode state.
+
+        Raises
+        ------
+        RuntimeError
+            If no backup state is available
+        """
+        if not self._backup_mode_name:
+            raise RuntimeError("No backup state available for rollback")
+
+        logging.info(f"Rolling back to backup mode: {self._backup_mode_name}")
+
+        # Stop any partially initialized orchestrators
+        await self._stop_current_orchestrators()
+
+        # Restore backup configuration
+        self.current_config = self._backup_config
+        mode_name = self._backup_mode_name
+
+        # Reinitialize orchestrators with backup config
+        if self.current_config:
+            self.fuser = Fuser(self.current_config)
+            self.action_orchestrator = ActionOrchestrator(self.current_config)
+            self.simulator_orchestrator = SimulatorOrchestrator(self.current_config)
+            self.background_orchestrator = BackgroundOrchestrator(self.current_config)
+
+        # Restart orchestrators
+        await self._start_orchestrators()
+
+        # Update mode manager to reflect rollback
+        self.mode_manager.state.current_mode = mode_name
+        logging.info(f"Successfully rolled back to mode: {mode_name}")
+
+    async def _emergency_mode_recovery(self, safe_mode: str):
+        """
+        Emergency recovery to a safe mode when rollback fails.
+
+        Parameters
+        ----------
+        safe_mode : str
+            The name of the safe mode to recover to
+        """
+        logging.warning(f"Initiating emergency recovery to safe mode: {safe_mode}")
+
+        # Stop all current orchestrators
+        await self._stop_current_orchestrators()
+
+        # Initialize safe mode from scratch
+        await self._initialize_mode(safe_mode)
+
+        # Start orchestrators
+        await self._start_orchestrators()
+
+        # Update mode manager
+        self.mode_manager.state.current_mode = safe_mode
+        self.mode_manager.state.previous_mode = None
+        logging.info(f"Emergency recovery to {safe_mode} completed")
 
     async def _stop_current_orchestrators(self):
         """
