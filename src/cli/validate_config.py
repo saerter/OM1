@@ -153,3 +153,4 @@ def fix_configuration(file_path: str, errors: list):
 
 if __name__ == "__main__":
     main()
+
