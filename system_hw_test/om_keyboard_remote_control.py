@@ -25,7 +25,18 @@ logging.basicConfig(
 
 OM_API_KEY = os.environ.get("OM_API_KEY", None)
 if not OM_API_KEY:
-    logging.error("OM_API_KEY environment variable not set.")
+    # Try to load from .env file in parent directory
+    env_path = os.path.join(os.path.dirname(__file__), "..", ".env")
+    if os.path.exists(env_path):
+        with open(env_path, "r") as f:
+            for line in f:
+                if line.startswith("OM_API_KEY="):
+                    OM_API_KEY = line.split("=", 1)[1].strip()
+                    break
+
+if not OM_API_KEY:
+    logging.error("OM_API_KEY not found in environment or .env file.")
+    logging.error("Please set OM_API_KEY environment variable or add it to .env file")
     sys.exit(1)
 
 
